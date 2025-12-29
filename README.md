@@ -23,7 +23,7 @@ Metrics: Optimized for MSE (Mean Squared Error) and Pixel Accuracy (derived from
 Supports dynamic resizing (Training on 768x768, Inference on 1024x1024).
 Outputs Alpha Matte, Composite on Checkerboard, and Green Screen visualization.
 
-![Results](figures/twin_swin_matte 001.png)
+![Results](figures/twin_swin_matte_001.png)
 
 ---
 ### 🧠 Model Architecture
@@ -33,7 +33,7 @@ Student Stream (Image Encoder): Active Swin-Tiny backbone taking the RGB Image a
 Adapter Modules: 1x1 Convolutions that "translate" RGB features into the Geometric feature space for loss calculation.
 Lightweight Decoder: A unified 64-channel decoder with RFB (Receptive Field Block) for efficient upsampling.
 
-![Model Architecture](figures/twin_swin_matte 002.png)
+![Model Architecture](figures/twin_swin_matte_002.png)
 
 ---
 ### 📂 Project Structure
