@@ -22,7 +22,7 @@ SWIN_VARIANTS = [
 
 # 👉 Change this index to switch models!
 # 0=Tiny(224), 1=Small(224), 2=Base(224), 3=Base(384), 4=Large(384)
-MODEL_IDX = 1
+MODEL_IDX = 4
 
 # Select backbone safely
 try:
@@ -32,14 +32,14 @@ except IndexError:
     BACKBONE = SWIN_VARIANTS[0]
 
 # --- 3. Hyperparameters ---
-IMG_SIZE = 512        # Image Size
-BATCH_SIZE = 8         # Adjust based on VRAM (e.g., 16 for Tiny, 4-8 for Base/384)
+IMG_SIZE = 1024        # Image Size
+BATCH_SIZE = 1         # Adjust based on VRAM (e.g., 16 for Tiny, 4-8 for Base/384)
 NUM_CLASSES = 1        # Number of classes
-NUM_EPOCHS = 2       # Total training epochs
+NUM_EPOCHS = 150       # Total training epochs
 NUM_WORKERS = 4        # Number of data loading threads
 PIN_MEMORY = True      # Accelerate data transfer to GPU
 
-LEARNING_RATE = 1e-4   # Transformers typically require lower LR than CNNs
+LEARNING_RATE = 2e-4   # Transformers typically require lower LR than CNNs
 SCHEDULER_T0 = 10
 SCHEDULER_T_MULT = 2
 SCHEDULER_ETA_MIN = 1e-6
