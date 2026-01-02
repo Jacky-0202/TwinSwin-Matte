@@ -32,8 +32,8 @@ except IndexError:
     BACKBONE = SWIN_VARIANTS[0]
 
 # --- 3. Hyperparameters ---
-IMG_SIZE = 1024        # Image Size
-BATCH_SIZE = 1         # Adjust based on VRAM (e.g., 16 for Tiny, 4-8 for Base/384)
+IMG_SIZE = 768         # Image Size
+BATCH_SIZE = 2         # Adjust based on VRAM (e.g., 16 for Tiny, 4-8 for Base/384)
 NUM_CLASSES = 1        # Number of classes
 NUM_EPOCHS = 150       # Total training epochs
 NUM_WORKERS = 4        # Number of data loading threads
