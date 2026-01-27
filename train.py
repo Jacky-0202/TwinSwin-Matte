@@ -142,7 +142,7 @@ def train():
         val_loop = tqdm(val_loader, desc=f"Epoch {epoch}/{config.NUM_EPOCHS} [Val  ]")
 
         with torch.no_grad():
-            for images, masks in val_loader:
+            for images, masks in val_loop:
                 images = images.to(config.DEVICE)
                 masks = masks.to(config.DEVICE)
 
