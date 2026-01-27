@@ -32,8 +32,8 @@ print(f"🔹 Selected Backbone: {MODEL_SELECT.upper()} ({BACKBONE_NAME})")
 
 # --- 3. Hyperparameters ---
 IMG_SIZE = 1024         # [Strategy] Locator uses 1024x1024 input
-BATCH_SIZE = 16         # [Advice] Base/Large: try 2.(for 16GB VRAM)
-NUM_EPOCHS = 100        # Locator converges relatively fast
+BATCH_SIZE = 2         # [Advice] Base/Large: try 2.(for 16GB VRAM)
+NUM_EPOCHS = 150        # Locator converges relatively fast
 LEARNING_RATE = 1e-4    # Standard for Transformers
 WEIGHT_DECAY = 1e-4     # AdamW standard
 
