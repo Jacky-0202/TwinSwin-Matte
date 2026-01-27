@@ -85,9 +85,9 @@ def train():
         train_loss_epoch = 0
         train_metrics = [0, 0, 0, 0] # mse, sad, grad, acc
 
-        loop = tqdm(train_loader, desc=f"Epoch {epoch}/{config.NUM_EPOCHS}")
+        train_loop = tqdm(train_loader, desc=f"Epoch {epoch}/{config.NUM_EPOCHS} [Train]")
         
-        for images, masks in loop:
+        for images, masks in train_loop:
             images = images.to(config.DEVICE)
             masks = masks.to(config.DEVICE)
 
@@ -125,7 +125,7 @@ def train():
                 m_vals = calculate_matting_metrics(pred_final, masks)
                 for i in range(4): train_metrics[i] += m_vals[i]
 
-            loop.set_postfix(loss=loss.item())
+            train_loop.set_postfix(loss=loss.item())
 
         # End of Epoch Scheduling
         scheduler.step()
@@ -139,7 +139,7 @@ def train():
         val_metrics = [0, 0, 0, 0]
         model.eval()
 
-        val_loop = tqdm(val_loader, desc=f"Epoch {epoch}/{config.NUM_EPOCHS} [Val  ]")
+        val_loop = tqdm(val_loader, desc=f"Epoch {epoch}/{config.NUM_EPOCHS} [Val]")
 
         with torch.no_grad():
             for images, masks in val_loop:
