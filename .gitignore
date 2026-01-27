@@ -11,7 +11,7 @@ env/
 .vscode/
 .idea/
 
-# 訓練產出的檔案 (不要上傳大檔案)
+# 訓練產出的檔案
 checkpoints/
 log/
 
