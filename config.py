@@ -3,86 +3,75 @@
 import torch
 import os
 
-# --- 1. Device Setup ---
+# --- 1. Device & System ---
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+NUM_WORKERS = 4         # Number of data loading threads
+PIN_MEMORY = True       # Accelerate data transfer to GPU
 
-# --- 2. Model Selection (List Mode) ---
-# List of available Swin Transformer backbones supported by timm.
-# Note: 384 versions provide better segmentation results but require more VRAM.
-SWIN_VARIANTS = [
-    # --- 224x224 Input (Window Size 7) ---
-    'swin_tiny_patch4_window7_224',    # [0] Tiny  (96 dim)  - Fastest, Low VRAM
-    'swin_small_patch4_window7_224',   # [1] Small (96 dim)  - Balanced
-    'swin_base_patch4_window7_224',    # [2] Base  (128 dim) - Strong
-    
-    # --- 384x384 Input (Window Size 12) ---
-    'swin_base_patch4_window12_384',   # [3] Base  (128 dim) - High Res, Heavy VRAM
-    'swin_large_patch4_window12_384'   # [4] Large (192 dim) - SOTA Level, Very Heavy
-]
+# --- 2. Model Selection (Easy Switch) ---
+# Dictionary of available Swin Transformer backbones
+# Note: 'window7' models are native 224x224, 'window12' are native 384x384.
+# TimM will handle resizing positional embeddings automatically.
+BACKBONE_OPTIONS = {
+    'tiny':  'swin_tiny_patch4_window7_224',    # [96 dim] Fastest, Good for debugging
+    'small': 'swin_small_patch4_window7_224',   # [96 dim] Deeper than Tiny
+    'base':  'swin_base_patch4_window7_224',    # [128 dim] Stronger performance
+    'base384': 'swin_base_patch4_window12_384', # [128 dim] High-res pretrained (Heavier)
+    'large': 'swin_large_patch4_window12_384'   # [192 dim] SOTA level (Requires 24GB+ VRAM)
+}
 
-# 👉 Change this index to switch models!
-# 0=Tiny(224), 1=Small(224), 2=Base(224), 3=Base(384), 4=Large(384)
-MODEL_IDX = 4
+# 👉 CHANGE THIS to switch models: 'tiny', 'small', 'base', 'base384', 'large'
+MODEL_SELECT = 'base' 
 
-# Select backbone safely
-try:
-    BACKBONE = SWIN_VARIANTS[MODEL_IDX]
-except IndexError:
-    print(f"⚠️ Invalid MODEL_IDX: {MODEL_IDX}, defaulting to [0] Tiny")
-    BACKBONE = SWIN_VARIANTS[0]
+# Safety check and assignment
+if MODEL_SELECT not in BACKBONE_OPTIONS:
+    raise ValueError(f"Invalid model selection: {MODEL_SELECT}. Choose from {list(BACKBONE_OPTIONS.keys())}")
+
+BACKBONE_NAME = BACKBONE_OPTIONS[MODEL_SELECT]
+print(f"🔹 Selected Backbone: {MODEL_SELECT.upper()} ({BACKBONE_NAME})")
 
 # --- 3. Hyperparameters ---
-IMG_SIZE = 768         # Image Size
-BATCH_SIZE = 2         # Adjust based on VRAM (e.g., 16 for Tiny, 4-8 for Base/384)
-NUM_CLASSES = 1        # Number of classes
-NUM_EPOCHS = 150       # Total training epochs
-NUM_WORKERS = 4        # Number of data loading threads
-PIN_MEMORY = True      # Accelerate data transfer to GPU
+IMG_SIZE = 1024         # [Strategy] Locator uses 1024x1024 input
+BATCH_SIZE = 16         # [Advice] Base/Large: try 2.(for 16GB VRAM)
+NUM_EPOCHS = 100        # Locator converges relatively fast
+LEARNING_RATE = 1e-4    # Standard for Transformers
+WEIGHT_DECAY = 1e-4     # AdamW standard
 
-LEARNING_RATE = 2e-4   # Transformers typically require lower LR than CNNs
-SCHEDULER_T0 = 10
-SCHEDULER_T_MULT = 2
-SCHEDULER_ETA_MIN = 1e-6
+# --- 4. Strategy Settings ---
+# [Twin-Swin Strategy]
+USE_TWIN_ALIGNMENT = True  # Enable Feature Alignment (Needs MaskEncoder)
+DILATE_MASK = True         # [Strategy] Dilate GT to prevent thin lines breaking at 1024
 
-# --- 4. Paths ---
-# Adjust these paths according to your environment
+# --- 5. Loss Weights (Optimized for Locator) ---
+# Weights for utils.loss.MattingLoss
+LOSS_WEIGHTS = {
+    'weight_bce': 1.0,     # Primary loss for Dilated GT
+    'weight_iou': 1.0,     # Ensure coverage (Recall)
+    'weight_ssim': 0.5,    # Structure consistency
+    'weight_l1': 0.2,      # Pixel regression
+    'weight_focal': 0.0,   # Disabled (BCE is sufficient for Dilated GT)
+    'weight_grad': 0.0,    # Disabled (Avoid fitting artificial edges)
+    'weight_feat': 0.2     # Feature Alignment weight
+}
+
+# --- 6. Paths ---
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+# DATASET_ROOT = "Datasets/DIS5K_Flat"  # Relative path
+DATASET_ROOT = "/home/tec/Desktop/Project/Datasets/DIS5K_Flat" # Absolute path (Safer)
 
-# Dataset Root Directory
-DATASET_ROOT = "/home/tec/Desktop/Project/Datasets/DIS5K_Flat"
+TRAIN_ROOT = os.path.join(DATASET_ROOT, 'train') # expects 'im' and 'gt' inside
+VAL_ROOT = os.path.join(DATASET_ROOT, 'val')     # expects 'im' and 'gt' inside
 
-# Expected DIS5K folder structure:
-# DIS5K_Flat/
-#   ├── train/
-#   │   ├── im/  (Images)
-#   │   └── gt/  (Masks)
-#   └── val/ ...
+# --- 7. Logging & Saving ---
+# Auto-generate experiment name based on model selection
+EXPERIMENT_NAME = f"TwinSwin_{MODEL_SELECT.capitalize()}_Loc1024"
 
-TRAIN_IMG_DIR = os.path.join(DATASET_ROOT, 'train/im')
-TRAIN_MASK_DIR = os.path.join(DATASET_ROOT, 'train/gt')
-VAL_IMG_DIR = os.path.join(DATASET_ROOT, 'val/im')
-VAL_MASK_DIR = os.path.join(DATASET_ROOT, 'val/gt')
+CHECKPOINT_DIR = os.path.join(PROJECT_ROOT, 'checkpoints', EXPERIMENT_NAME)
+LOG_DIR = os.path.join(PROJECT_ROOT, 'logs', EXPERIMENT_NAME)
 
-# --- 5. Checkpoints & Logging ---
-CHECKPOINT_DIR = os.path.join(PROJECT_ROOT, 'checkpoints')
+# Ensure directories exist
+os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+os.makedirs(LOG_DIR, exist_ok=True)
 
-# Generate a unique experiment name based on the selected model
-# e.g., "Swin_Tiny_ADE20K" or "Swin_Base384_ADE20K"
-model_tag = 'Unknown'
-if 'tiny' in BACKBONE: model_tag = 'Tiny'
-elif 'small' in BACKBONE: model_tag = 'Small'
-elif 'base' in BACKBONE: model_tag = 'Base'
-elif 'large' in BACKBONE: model_tag = 'Large'
-
-if '384' in BACKBONE:
-    model_tag += '_384'
-
-# EXPERIMENT_NAME = f"Swin_{model_tag}_ADE20K"
-EXPERIMENT_NAME = f"TwinSwin_{model_tag}_DIS5K_test"
-SAVE_DIR = os.path.join(CHECKPOINT_DIR, EXPERIMENT_NAME)
-
-BEST_MODEL_PATH = os.path.join(SAVE_DIR, 'best_model.pth')
-LAST_MODEL_PATH = os.path.join(SAVE_DIR, 'last_model.pth')
-
-# Ensure the save directory exists
-os.makedirs(SAVE_DIR, exist_ok=True)
+BEST_MODEL_PATH = os.path.join(CHECKPOINT_DIR, 'best_model.pth')
+LAST_MODEL_PATH = os.path.join(CHECKPOINT_DIR, 'last_model.pth')

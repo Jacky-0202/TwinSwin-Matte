@@ -7,6 +7,7 @@ import cv2
 import numpy as np
 from PIL import Image
 from torchvision import transforms
+from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 import torch.nn.functional as F
 
@@ -21,21 +22,58 @@ from models.twin_swin_matte import TwinSwinMatteNet
 INPUT_DIR = 'test_data'         # Directory for input test images
 OUTPUT_DIR = 'test_results'     # Directory for output results
 
-# Model Path (Automatically point to the best model)
+# Batch Size for Inference (Adjust based on your VRAM, e.g., 4, 8, 16)
+BATCH_SIZE = 8                  
+
+# Model Path
 MODEL_PATH = config.BEST_MODEL_PATH
 
 # Inference Size (Height, Width)
-# We use the IMG_SIZE defined in config (e.g., 1024 or 768)
-IMG_SIZE = config.IMG_SIZE
+# All images will be resized to this size before entering the model
+IMG_SIZE = config.IMG_SIZE 
 
-# --- 2. Visualization Helper ---
+# --- 2. Inference Dataset ---
+class InferenceDataset(Dataset):
+    def __init__(self, root_dir, img_size, transform):
+        self.root_dir = root_dir
+        self.img_size = img_size
+        self.transform = transform
+        
+        valid_ext = ('.jpg', '.jpeg', '.png', '.bmp')
+        self.files = sorted([f for f in os.listdir(root_dir) if f.lower().endswith(valid_ext)])
+        
+        if len(self.files) == 0:
+            print(f"⚠️ No images found in {root_dir}")
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        img_name = self.files[idx]
+        img_path = os.path.join(self.root_dir, img_name)
+        
+        # Load Image
+        image = Image.open(img_path).convert('RGB')
+        orig_w, orig_h = image.size
+        
+        # Resize to fixed size for batching (Model requires fixed size input)
+        # Note: Must resize here first to allow packing into a Batch
+        img_resized = image.resize((self.img_size, self.img_size), Image.BILINEAR)
+        
+        # Apply Transforms (ToTensor + Normalize)
+        img_tensor = self.transform(img_resized)
+        
+        # Return tensor, filename, and original dimensions (for restoring later)
+        return img_tensor, img_name, orig_w, orig_h
+
+# --- 3. Visualization Helper ---
 def generate_checkerboard(h, w, tile_size=20):
     """
     Generates a checkerboard background for visualizing alpha transparency.
     """
     checkerboard = np.zeros((h, w, 3), dtype=np.uint8)
-    color1 = (255, 255, 255) # White
-    color2 = (200, 200, 200) # Light Gray
+    color1 = (255, 255, 255) 
+    color2 = (200, 200, 200) 
     
     for y in range(0, h, tile_size):
         for x in range(0, w, tile_size):
@@ -45,85 +83,49 @@ def generate_checkerboard(h, w, tile_size=20):
                 checkerboard[y:y+tile_size, x:x+tile_size] = color2
     return checkerboard
 
-# --- 3. Inference Pipeline ---
-def process_image(img_path, model, device, transform):
+def save_result(alpha_tensor, img_name, orig_w, orig_h, save_dir):
     """
-    Pipeline: 
-    1. Load Image (RGB)
-    2. Resize to IMG_SIZE
-    3. Predict Alpha
-    4. Upsample Alpha back to Original Size
+    Saves the alpha matte restored to original size.
     """
-    # 1. Load original image
-    # Image.MAX_IMAGE_PIXELS = None # Enable if dealing with massive images
-    original_img = Image.open(img_path).convert('RGB')
-    orig_w, orig_h = original_img.size 
+    # alpha_tensor: (1, H, W) on GPU
     
-    # 2. Preprocessing (ToTensor + Normalize)
-    # Unsqueeze to add batch dim: (1, 3, H, W)
-    input_tensor = transform(original_img).unsqueeze(0).to(device)
+    # 1. Upsample back to Original Size
+    # Note: Input must be 4D (N, C, H, W), so unsqueeze is needed
+    alpha_resized = F.interpolate(
+        alpha_tensor.unsqueeze(0), 
+        size=(orig_h, orig_w), 
+        mode='bilinear', 
+        align_corners=True
+    )
     
-    # 3. Resize input to Inference Size
-    input_resized = F.interpolate(input_tensor, size=IMG_SIZE, mode='bilinear', align_corners=True)
-    
-    # 4. Model Inference
-    with torch.no_grad():
-        # Forward pass without GT (GT Encoder is idle)
-        # Returns: pred_alpha, (stu_feats), (gt_feats=None)
-        pred_alpha, _, _ = model(input_resized, gt_mask=None)
-    
-    # 5. Upsample Alpha back to Original Size
-    # pred_alpha is (1, 1, H, W) with values 0.0 ~ 1.0
-    output_alpha = F.interpolate(pred_alpha, size=(orig_h, orig_w), mode='bilinear', align_corners=True)
-    
-    # 6. Post-processing
-    # Remove batch and channel dim -> (H, W)
-    alpha_np = output_alpha.squeeze().cpu().numpy()
-    
-    # Ensure range 0~1
+    # 2. Convert to Numpy
+    alpha_np = alpha_resized.squeeze().cpu().numpy() # (H, W)
     alpha_np = np.clip(alpha_np, 0, 1)
-        
-    return alpha_np, original_img
+    
+    # 3. Save Alpha
+    save_base_name = os.path.splitext(img_name)[0]
+    alpha_uint8 = (alpha_np * 255).astype(np.uint8)
+    cv2.imwrite(os.path.join(save_dir, save_base_name + "_alpha.png"), alpha_uint8)
 
-def save_matting_results(alpha_map, original_img_pil, save_base_path):
-    """
-    Saves two files:
-    1. _alpha.png: The grayscale alpha matte.
-    2. _composite.png: The foreground composited on a checkerboard.
-    """
-    orig_np = np.array(original_img_pil) # RGB
-    h, w, _ = orig_np.shape
-    
-    # Convert alpha to 0-255 uint8 for saving
-    alpha_uint8 = (alpha_map * 255).astype(np.uint8)
-    
-    # --- 1. Save Alpha Matte ---
-    cv2.imwrite(save_base_path + "_alpha.png", alpha_uint8)
-    
-    # --- 2. Save Composite (Checkerboard) ---
-    # Create checkerboard background
-    bg_checker = generate_checkerboard(h, w, tile_size=32)
-    
-    # Alpha blending: F * alpha + B * (1 - alpha)
-    # Expand alpha to 3 channels: (H, W) -> (H, W, 3)
-    alpha_3c = np.dstack((alpha_map, alpha_map, alpha_map))
-    
-    composite = (orig_np * alpha_3c + bg_checker * (1 - alpha_3c)).astype(np.uint8)
-    # Convert RGB to BGR for OpenCV
-    # cv2.imwrite(save_base_path + "_composite.png", cv2.cvtColor(composite, cv2.COLOR_RGB2BGR))
+    # (Optional) Save Composite
+    # If a composite image is needed, reload the original image here 
+    # (To save memory, original images are not returned in the Dataset)
+    # img_path = os.path.join(INPUT_DIR, img_name)
+    # orig_img = cv2.imread(img_path)
+    # ... (Compositing logic) ...
 
 def main():
     # Setup
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     if not os.path.exists(INPUT_DIR):
-        os.makedirs(INPUT_DIR, exist_ok=True)
-        print(f"📁 Created '{INPUT_DIR}'. Please put test images here.")
+        print(f"❌ Input directory '{INPUT_DIR}' not found.")
         return
 
     device = config.DEVICE
     print(f"🚀 Loading Model from: {MODEL_PATH}")
     print(f"   Backbone: {config.BACKBONE}")
-    print(f"   Inference Size: {IMG_SIZE}")
+    print(f"   Inference Size: {IMG_SIZE}x{IMG_SIZE}")
+    print(f"   Batch Size: {BATCH_SIZE}")
 
     # Initialize Model
     model = TwinSwinMatteNet(
@@ -146,7 +148,6 @@ def main():
             return
     else:
         print(f"❌ Weight file not found at: {MODEL_PATH}")
-        print("   Please check config.py or train the model first.")
         return
 
     # Transforms
@@ -155,28 +156,40 @@ def main():
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
 
-    # Get images
-    valid_ext = ('.jpg', '.jpeg', '.png', '.bmp')
-    image_files = [f for f in os.listdir(INPUT_DIR) if f.lower().endswith(valid_ext)]
+    # --- Prepare DataLoader ---
+    test_dataset = InferenceDataset(INPUT_DIR, IMG_SIZE, transform)
     
-    if not image_files:
-        print(f"⚠️ No images found in '{INPUT_DIR}'")
+    if len(test_dataset) == 0:
         return
 
-    print(f"📂 Found {len(image_files)} images. Processing...")
+    test_loader = DataLoader(
+        test_dataset, 
+        batch_size=BATCH_SIZE, 
+        shuffle=False, 
+        num_workers=4,  # Adjust based on your CPU
+        pin_memory=True
+    )
+
+    print(f"📂 Found {len(test_dataset)} images. Processing in batches...")
     
-    for img_name in tqdm(image_files):
-        img_path = os.path.join(INPUT_DIR, img_name)
-        save_base_name = os.path.splitext(img_name)[0]
-        save_full_path = os.path.join(OUTPUT_DIR, save_base_name)
-        
-        try:
-            alpha_map, orig_pil = process_image(img_path, model, device, transform)
-            save_matting_results(alpha_map, orig_pil, save_full_path)
-        except Exception as e:
-            print(f"⚠️ Error processing {img_name}: {e}")
-            import traceback
-            traceback.print_exc()
+    # --- Inference Loop ---
+    with torch.no_grad():
+        for batch_imgs, batch_names, batch_ws, batch_hs in tqdm(test_loader):
+            batch_imgs = batch_imgs.to(device)
+            
+            # Forward Pass (Batch Inference)
+            # Output shape: (Batch_Size, 1, IMG_SIZE, IMG_SIZE)
+            preds, _, _ = model(batch_imgs, gt_mask=None)
+            
+            # Process each image in the batch
+            for i in range(len(batch_imgs)):
+                img_name = batch_names[i]
+                orig_w = batch_ws[i].item()
+                orig_h = batch_hs[i].item()
+                alpha_pred = preds[i] # (1, H, W)
+                
+                # Restore size and Save
+                save_result(alpha_pred, img_name, orig_w, orig_h, OUTPUT_DIR)
 
     print(f"\n✅ All Done! Results saved to '{OUTPUT_DIR}'")
 

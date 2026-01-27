@@ -7,6 +7,8 @@ import torch
 class CSVLogger:
     def __init__(self, save_dir, filename='training_log.csv'):
         """
+        Initialize the CSV Logger.
+        
         Args:
             save_dir (str): Directory where the log file will be saved.
             filename (str): Name of the CSV file.
@@ -14,19 +16,18 @@ class CSVLogger:
         self.save_dir = save_dir
         self.filepath = os.path.join(save_dir, filename)
         
-        # [UPDATED] Define headers for TwinSwin-Matte task
-        # Replaced Dice/mIoU with SAD, MSE, and MAD
+        # Define CSV headers
+        # Metrics: Loss, MSE, SAD, Grad, Accuracy
         self.headers = [
             'Epoch', 'LR', 
-            'Train_Loss', 'Train_MSE', 'Train_Acc', 
-            'Val_Loss',   'Val_MSE',   'Val_Acc'
+            'Train_Loss', 'Train_MSE', 'Train_SAD', 'Train_Grad', 'Train_Acc', 
+            'Val_Loss',   'Val_MSE',   'Val_SAD',   'Val_Grad',   'Val_Acc'
         ]
         
         # Ensure the directory exists
         os.makedirs(save_dir, exist_ok=True)
         
         # Create file and write headers (overwrite mode 'w')
-        # Note: If you restart training, this will overwrite the old log!
         with open(self.filepath, mode='w', newline='') as f:
             writer = csv.writer(f)
             writer.writerow(self.headers)
@@ -36,32 +37,28 @@ class CSVLogger:
     def log(self, data):
         """
         Write a single row of data to the CSV.
-        Automatically converts Tensors and formats floats to specific decimal places.
-        
-        Args:
-            data (list): List of data values to write. 
-                         Expected length: 10 (matching headers)
+        Data should match the order of self.headers.
         """
         clean_data = []
         
         for x in data:
-            # 1. Handle PyTorch Tensors (convert to float/int)
+            # 1. Handle PyTorch Tensors (detach to CPU)
             if isinstance(x, torch.Tensor):
                 x = x.detach().cpu().item()
             
-            # 2. Handle Floats (Format precision)
-            if isinstance(x, float):
-                # Heuristic: If number is very small (like LR < 0.0001 or MSE), use scientific notation
-                if 0 < abs(x) < 0.0001:
+            # 2. Handle Floats (Unified formatting)
+            if isinstance(x, (float, int)):
+                # Use scientific notation for very small numbers, else 6 decimal places
+                if isinstance(x, float) and 0 < abs(x) < 1e-4:
                     clean_data.append(f"{x:.4e}")
-                # For SAD (can be large, e.g., 50.12), standard float is fine
+                elif isinstance(x, float):
+                    clean_data.append(f"{x:.6f}")
                 else:
-                    clean_data.append(f"{x:.4f}")
+                    clean_data.append(x)
             else:
-                # Keep integers or strings as is
                 clean_data.append(x)
 
-        # Write the cleaned and formatted data to CSV
+        # Use 'a' (append) mode to ensure data is saved even if training crashes
         with open(self.filepath, mode='a', newline='') as f:
             writer = csv.writer(f)
             writer.writerow(clean_data)

@@ -1,12 +1,14 @@
-# utils/loss.py
-
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import Variable
 
+# --- 1. SSIM Loss (Structural Similarity) ---
 class SSIMLoss(nn.Module):
+    """
+    Calculates the Structural Similarity Index (SSIM) Loss.
+    """
     def __init__(self, window_size=11, size_average=True):
         super(SSIMLoss, self).__init__()
         self.window_size = window_size
@@ -48,91 +50,116 @@ class SSIMLoss(nn.Module):
 
     def forward(self, img1, img2):
         (_, channel, _, _) = img1.size()
-
+        
         if channel == self.channel and self.window.data.type() == img1.data.type():
             window = self.window
         else:
             window = self.create_window(self.window_size, channel)
-            
             if img1.is_cuda:
                 window = window.cuda(img1.get_device())
             window = window.type_as(img1)
-            
             self.window = window
             self.channel = channel
-
+            
         return 1.0 - self._ssim(img1, img2, window, self.window_size, channel, self.size_average)
 
-
+# --- 2. IoU Loss (Intersection over Union) ---
 class IoULoss(nn.Module):
+    """
+    Calculates the Soft IoU Loss using probabilities.
+    """
     def __init__(self, smooth=1e-6):
         super(IoULoss, self).__init__()
         self.smooth = smooth
 
     def forward(self, pred, gt):
-        # Soft IoU
+        # inputs are already probabilities [0, 1]
         intersection = (pred * gt).sum(dim=(2, 3))
         total = (pred + gt).sum(dim=(2, 3))
         union = total - intersection
         
         iou = (intersection + self.smooth) / (union + self.smooth)
         return 1.0 - iou.mean()
-    
+
+# --- 3. Main Loss Wrapper (Fixed for Logits & AMP) ---
 class MattingLoss(nn.Module):
-    def __init__(self, weight_bce=1.0, weight_l1=1.0, weight_ssim=0.5, weight_iou=0.5, weight_feat=0.0):
+    """
+    Composite Loss function for Locator Matting.
+    Handles Logits inputs correctly for mixed precision training.
+    """
+    def __init__(self, 
+                 weight_bce=1.0,    
+                 weight_iou=1.0,    
+                 weight_ssim=0.5,   
+                 weight_l1=0.2,     
+                 weight_focal=0.0,  
+                 weight_grad=0.0,   
+                 weight_feat=0.2):  
         super(MattingLoss, self).__init__()
         
         self.weight_bce = weight_bce
-        self.weight_l1 = weight_l1
-        self.weight_ssim = weight_ssim
         self.weight_iou = weight_iou
+        self.weight_ssim = weight_ssim
+        self.weight_l1 = weight_l1
+        self.weight_focal = weight_focal # (Not used in this fix, kept for compatibility)
+        self.weight_grad = weight_grad
         self.weight_feat = weight_feat
         
-        self.bce = nn.BCELoss()
-        self.l1 = nn.L1Loss()
-        self.mse = nn.MSELoss()
+        # [FIX] Use BCEWithLogitsLoss for numerical stability with AMP
+        self.bce_logits = nn.BCEWithLogitsLoss()
+        
         self.iou = IoULoss()
         self.ssim = SSIMLoss(window_size=11)
-        
+        self.l1 = nn.L1Loss()
+        self.mse = nn.MSELoss()
 
-    def forward(self, pred_alpha, gt_alpha, stu_feats=None, tea_feats=None):
+    def forward(self, pred_logits, gt_alpha, stu_feats=None, tea_feats=None):
         """
         Args:
-            pred_alpha: (B, 1, H, W) range 0~1
-            gt_alpha:   (B, 1, H, W) range 0~1
+            pred_logits (Tensor): Raw model output (Logits), NOT probabilities. (B, 1, H, W)
+            gt_alpha (Tensor): Ground Truth mask (0 or 1). (B, 1, H, W)
+            stu_feats, tea_feats: Feature maps for alignment.
         """
-        epsilon = 1e-6
-        pred_f32 = pred_alpha.float()
+        
+        # 1. Prepare Ground Truth
         gt_f32 = gt_alpha.float()
-        pred_clamped = torch.clamp(pred_f32, epsilon, 1.0 - epsilon)
         
-        # --- 1. BCE Loss (強制關閉 Autocast) ---
-        with torch.autocast(device_type='cuda', enabled=False):
-            loss_bce = self.bce(pred_clamped, gt_f32)
+        # 2. Calculate BCE Loss (Uses Logits directly)
+        # This is safe for Autocast
+        loss_bce = 0.0
+        if self.weight_bce > 0:
+            loss_bce = self.bce_logits(pred_logits, gt_f32)
         
-        # --- 2. L1 Loss ---
-        loss_l1 = self.l1(pred_alpha, gt_alpha)
+        # 3. Generate Probabilities for other losses
+        # Sigmoid is required for IoU, SSIM, L1
+        pred_prob = torch.sigmoid(pred_logits)
         
-        # --- 3. SSIM Loss ---
-        loss_ssim = self.ssim(pred_alpha, gt_alpha)
+        # Clamp for numerical safety in other losses (optional but good practice)
+        epsilon = 1e-6
+        pred_prob = torch.clamp(pred_prob, epsilon, 1.0 - epsilon)
         
-        # --- 4. IoU Loss ---
-        loss_iou = self.iou(pred_alpha, gt_alpha)
+        # 4. Calculate Other Losses (Using Probabilities)
+        loss_iou = self.iou(pred_prob, gt_f32) if self.weight_iou > 0 else 0.0
+        loss_l1 = self.l1(pred_prob, gt_f32) if self.weight_l1 > 0 else 0.0
+        loss_ssim = self.ssim(pred_prob, gt_f32) if self.weight_ssim > 0 else 0.0
         
-        # --- 5. Feature Loss ---
-        loss_feat = 0.0
+        # 5. Feature Alignment Loss
+        loss_feat = torch.tensor(0.0, device=pred_logits.device)
         if self.weight_feat > 0 and stu_feats is not None and tea_feats is not None:
-            with torch.autocast(device_type='cuda', enabled=False):
+            if isinstance(stu_feats, (list, tuple)):
                 for s_f, t_f in zip(stu_feats, tea_feats):
                     loss_feat += self.mse(s_f.float(), t_f.float())
+            else:
+                loss_feat += self.mse(stu_feats.float(), tea_feats.float())
         
-        # --- Total Loss ---
+        # 6. Total Loss
         total_loss = (self.weight_bce * loss_bce) + \
-                     (self.weight_l1 * loss_l1) + \
-                     (self.weight_ssim * loss_ssim) + \
                      (self.weight_iou * loss_iou) + \
+                     (self.weight_ssim * loss_ssim) + \
+                     (self.weight_l1 * loss_l1) + \
                      (self.weight_feat * loss_feat)
-                     
-        loss_detail = loss_ssim + loss_iou
+        
+        # Detail metric
+        loss_detail = loss_iou + loss_ssim
         
         return total_loss, loss_l1, loss_detail, loss_feat
