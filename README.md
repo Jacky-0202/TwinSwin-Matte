@@ -80,7 +80,7 @@ git clone https://github.com/Jacky-0202/TwinSwin-Matte.git
 cd TwinSwin-Matte
 ```
 
--Create and Activate Virtual Environment
+- Create and Activate Virtual Environment
 
 ```bash
 # Create virtual environment named '.venv'
@@ -99,8 +99,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-- Prepare Dataset (DIS-5K) We use the DIS-5K dataset. Since the original structure is nested, use our helper script to flatten it.
-
+Prepare Dataset (DIS-5K) We use the DIS-5K dataset. Since the original structure is nested, use our helper script to flatten it.
 Download DIS-5K.
 
 Configure paths in `preprocess_dis5k.py` .
