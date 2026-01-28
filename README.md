@@ -73,20 +73,33 @@ TwinSwin-Matte/
 
 ---
 ### 🛠️ Installation
-Clone the repository
+- Clone the repository
 
 ```bash
 git clone https://github.com/Jacky-0202/TwinSwin-Matte.git
 cd TwinSwin-Matte
 ```
 
-Install dependencies
+-Create and Activate Virtual Environment
+
+```bash
+# Create virtual environment named '.venv'
+python -m venv .venv
+
+# Activate it (Linux/macOS)
+source .venv/bin/activate
+
+# Activate it (Windows)
+# .venv\Scripts\activate
+```
+
+- Install dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-Prepare Dataset (DIS-5K) We use the DIS-5K dataset. Since the original structure is nested, use our helper script to flatten it.
+- Prepare Dataset (DIS-5K) We use the DIS-5K dataset. Since the original structure is nested, use our helper script to flatten it.
 
 Download DIS-5K.
 
