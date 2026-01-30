@@ -127,7 +127,7 @@ class Config:
 
     # [Memory & Speed]
     BATCH_SIZE = 16            # Recommended: 2 for Large Model
-    NUM_WORKERS = 8           # CPU cores
+    NUM_WORKERS = 4            # CPU cores
     PIN_MEMORY = True         
     USE_AMP = True            # Mixed Precision (Essential for H200)
     GRAD_ACCUM_STEPS = 4      # Effective Batch Size = 2 * 4 = 8
@@ -165,7 +165,7 @@ class Config:
     # 6. Output Paths
     # =========================================================================
     # Checkpoints will be saved here
-    timestamp = datetime.now().strftime("%m%d_%H%M")
+    timestamp = datetime.now().strftime("%Y%m%d%H%M")
     CHECKPOINT_DIR = f"./checkpoints/TwinSwin_{TASK_NAME}_{MODE}_{IMG_SIZE}_{timestamp}"
 
     @staticmethod
