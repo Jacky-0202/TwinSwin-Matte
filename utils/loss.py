@@ -1,13 +1,15 @@
-import math
+# utils/loss.py
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 from torch.autograd import Variable
+from config import Config
 
 # ==========================================
-# 1. Structure Loss (Derived from BiRefNet / F3Net)
-#    Core Function: Edge-weighted perception.
-#    It assigns higher weights to boundary areas to fix inaccurate edges.
+# 1. Structure Loss (The Soul of BiRefNet)
+#    Focuses on edge-weighted perception.
 # ==========================================
 class StructureLoss(nn.Module):
     def __init__(self):
@@ -17,48 +19,45 @@ class StructureLoss(nn.Module):
         """
         Args:
             pred: Model Logits (B, 1, H, W) -> Before Sigmoid
-            mask: Ground Truth (B, 1, H, W) -> 0 or 1
+            mask: Ground Truth (B, 1, H, W) -> 0~1 Float
         """
         # 1. Generate Edge-Weighted Map (weit)
-        # Apply AvgPool to GT to blur it, then subtract from original GT.
-        # The absolute difference is maximized at the edges.
         wb = 1.0
         target = mask.float()
         
-        # Uses a 31x31 Kernel to detect edges
+        # Use AvgPool to find edges (High variance areas)
+        # padding=15 matches kernel_size=31
         weit = 1 + 5 * torch.abs(F.avg_pool2d(target, kernel_size=31, stride=1, padding=15) - target)
         
-        # 2. Weighted BCE Loss (Focuses heavily on edges)
+        # 2. Weighted BCE Loss
+        # Clamp logits for numerical stability to prevent NaN
+        pred = torch.clamp(pred, min=-10, max=10) 
         wbce = F.binary_cross_entropy_with_logits(pred, target, reduction='none')
         wbce = (weit * wbce).sum(dim=(2, 3)) / weit.sum(dim=(2, 3))
 
-        # 3. Weighted IoU Loss (Structure-aware)
+        # 3. Weighted IoU Loss
         pred_prob = torch.sigmoid(pred)
         inter = ((pred_prob * target) * weit).sum(dim=(2, 3))
         union = ((pred_prob + target) * weit).sum(dim=(2, 3))
         wiou = 1 - (inter + 1) / (union - inter + 1)
 
-        # Return the average of both Weighted BCE and Weighted IoU
+        # Return average of BCE + IoU
         return (wbce + wiou).mean()
 
 # ==========================================
-# 2. Gradient Loss (Essential for Matting)
-#    Core Function: Enforces gradient consistency.
-#    Ensures that the predicted edges are as sharp as the GT.
+# 2. Gradient Loss (Sharpness Enforcer)
 # ==========================================
 class GradientLoss(nn.Module):
     def __init__(self):
         super(GradientLoss, self).__init__()
-        # Sobel Kernels for X and Y directions
-        kernel_x = torch.Tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]])
-        kernel_y = torch.Tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]])
-        self.kernel_x = kernel_x.view((1, 1, 3, 3))
-        self.kernel_y = kernel_y.view((1, 1, 3, 3))
+        # Sobel Kernels
+        kernel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32)
+        kernel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32)
+        self.kernel_x = kernel_x.view(1, 1, 3, 3)
+        self.kernel_y = kernel_y.view(1, 1, 3, 3)
 
     def forward(self, pred, gt):
-        # pred, gt: (B, 1, H, W) Probability maps [0, 1]
-        
-        # Ensure kernels are on the same device as input
+        # Move kernels to same device as input on the fly
         if pred.device != self.kernel_x.device:
             self.kernel_x = self.kernel_x.to(pred.device)
             self.kernel_y = self.kernel_y.to(pred.device)
@@ -69,13 +68,11 @@ class GradientLoss(nn.Module):
         gt_grad_x = F.conv2d(gt, self.kernel_x, padding=1)
         gt_grad_y = F.conv2d(gt, self.kernel_y, padding=1)
 
-        # Calculate L1 distance between gradients (Enforces sharpness)
-        grad_loss = torch.abs(pred_grad_x - gt_grad_x) + torch.abs(pred_grad_y - gt_grad_y)
-        return grad_loss.mean()
+        # L1 distance between gradients
+        return (torch.abs(pred_grad_x - gt_grad_x) + torch.abs(pred_grad_y - gt_grad_y)).mean()
 
 # ==========================================
-# 3. SSIM Loss (Auxiliary Structural Integrity)
-#    Core Function: Maintains local structural similarity (luminance/contrast/structure).
+# 3. SSIM Loss (Structural Consistency)
 # ==========================================
 class SSIMLoss(nn.Module):
     def __init__(self, window_size=11, size_average=True):
@@ -119,8 +116,6 @@ class SSIMLoss(nn.Module):
 
     def forward(self, img1, img2):
         (_, channel, _, _) = img1.size()
-        
-        # Check if window needs to be re-initialized (e.g., if device changed)
         if channel == self.channel and self.window.data.type() == img1.data.type():
             window = self.window
         else:
@@ -130,81 +125,101 @@ class SSIMLoss(nn.Module):
             window = window.type_as(img1)
             self.window = window
             self.channel = channel
-            
         return 1.0 - self._ssim(img1, img2, window, self.window_size, channel, self.size_average)
 
 # ==========================================
-# 4. Main Loss Wrapper (Integrated Version)
-#    Combines BiRefNet's Structure Loss with Matting Losses.
+# 4. Total Loss Factory (The Adapter)
+#    Connects Config -> Model Output -> Loss Components
 # ==========================================
-class MattingLoss(nn.Module):
-    def __init__(self, 
-                 weight_struct=1.0, # [BiRefNet] Structure & Edge weighting (Includes weighted BCE + IoU)
-                 weight_l1=1.0,     # [Matting] Pixel-level absolute error (Core for regression)
-                 weight_grad=1.0,   # [Matting] Gradient sharpness
-                 weight_ssim=0.5,   # [Common] Structural integrity
-                 weight_feat=0.2):  # [Twin] Feature alignment (if Teacher is used)
-        super(MattingLoss, self).__init__()
+class TotalLoss(nn.Module):
+    def __init__(self):
+        super(TotalLoss, self).__init__()
         
-        self.weight_struct = weight_struct
-        self.weight_l1 = weight_l1
-        self.weight_grad = weight_grad
-        self.weight_ssim = weight_ssim
-        self.weight_feat = weight_feat
+        # Load weights from Config (The Control Center)
+        self.weights = Config.LOSS_WEIGHTS
         
-        # Initialize Loss Modules
+        # Initialize components
         self.structure_loss = StructureLoss()
         self.l1 = nn.L1Loss()
         self.grad = GradientLoss()
         self.ssim = SSIMLoss()
-        self.mse = nn.MSELoss()
+        self.mse = nn.MSELoss() # For Feature Alignment
 
-    def forward(self, pred_logits, gt_alpha, stu_feats=None, tea_feats=None):
+    def forward(self, outputs, target, teacher_feats=None):
         """
+        Unified Forward Pass.
+        
         Args:
-            pred_logits: Model Output (B, 1, H, W), Raw Logits (No Sigmoid)
-            gt_alpha:    Ground Truth (B, 1, H, W), Values [0, 1]
-            stu_feats:   Student Features (List of tensors)
-            tea_feats:   Teacher Features (List of tensors)
+            outputs (dict): {'fine': Logits, 'feats': [Student Features]}
+            target (Tensor): GT Mask (B, 1, H, W)
+            teacher_feats (list): [Teacher Features] (Optional, passed from train.py)
+        
+        Returns:
+            total_loss (Tensor): Scalar for backward
+            loss_dict (dict): Breakdown for logging
         """
-        gt_f32 = gt_alpha.float()
+        pred_logits = outputs['fine']
+        stu_feats = outputs.get('feats', None)
+        gt_f32 = target.float()
         
-        # --- 1. Structure Loss (Uses Logits) ---
-        # This is the core of BiRefNet, responsible for overall shape and hard edges.
-        loss_struct = 0.0
-        if self.weight_struct > 0:
-            loss_struct = self.structure_loss(pred_logits, gt_f32)
+        total_loss = 0.0
+        loss_dict = {}
 
-        # --- 2. Prepare Probability Map (Sigmoid) for other Losses ---
+        # --- A. Structure Loss (Uses Logits) ---
+        # "weight_struct" corresponds to 'bce' + 'dice' conceptual role in BiRefNet context
+        # But let's look for a specific key if defined, or map standard Matting keys.
+        # Since Config defines 'l1', 'grad', 'ssim', 'feat', let's stick to those.
+        # However, StructureLoss combines BCE and IoU. Let's map it to 'struct' if exists,
+        # or treat it as a base component if MODE is 'LOCATOR' or 'MATTING'.
+        
+        # Let's map 'bce' weight to StructureLoss for simplicity, 
+        # or use a new key 'struct' in Config if you prefer.
+        # For now, let's assume if we are in MATTING mode, we rely on L1/Grad/SSIM.
+        # If we want BiRefNet power, we should probably add 'struct' to Config.
+        
+        # [AUTO-ADAPTATION]
+        # If Config has 'bce' > 0 (Locator), we use StructureLoss as it's better than plain BCE.
+        w_struct = self.weights.get('bce', 0.0) + self.weights.get('dice', 0.0) # Combine weights
+        if w_struct > 0:
+            l_struct = self.structure_loss(pred_logits, gt_f32)
+            total_loss += w_struct * l_struct
+            loss_dict['struct'] = l_struct.item()
+
+        # --- B. Probability-based Losses (Sigmoid) ---
         pred_prob = torch.sigmoid(pred_logits)
-        
-        # --- 3. Pixel-level Losses ---
-        # L1: Numerical regression, most important for Matting accuracy.
-        loss_l1 = self.l1(pred_prob, gt_f32) if self.weight_l1 > 0 else 0.0
-        
-        # Grad: Edge sharpening.
-        loss_grad = self.grad(pred_prob, gt_f32) if self.weight_grad > 0 else 0.0
-        
-        # SSIM: Local structural similarity.
-        loss_ssim = self.ssim(pred_prob, gt_f32) if self.weight_ssim > 0 else 0.0
-        
-        # --- 4. Feature Alignment (Twin Strategy) ---
-        loss_feat = torch.tensor(0.0, device=pred_logits.device)
-        if self.weight_feat > 0 and stu_feats is not None and tea_feats is not None:
-            if isinstance(stu_feats, (list, tuple)):
-                for s_f, t_f in zip(stu_feats, tea_feats):
-                    loss_feat += self.mse(s_f.float(), t_f.float())
-            else:
-                loss_feat += self.mse(stu_feats.float(), tea_feats.float())
-        
-        # --- 5. Total Loss Summation ---
-        total_loss = (self.weight_struct * loss_struct) + \
-                     (self.weight_l1 * loss_l1) + \
-                     (self.weight_grad * loss_grad) + \
-                     (self.weight_ssim * loss_ssim) + \
-                     (self.weight_feat * loss_feat)
-        
-        # Detailed metrics for logging (Observe changes in Struct and L1)
-        loss_detail = loss_struct + loss_l1
-        
-        return total_loss, loss_l1, loss_detail, loss_feat
+
+        # 1. L1 Loss
+        w_l1 = self.weights.get('l1', 0.0)
+        if w_l1 > 0:
+            l_l1 = self.l1(pred_prob, gt_f32)
+            total_loss += w_l1 * l_l1
+            loss_dict['l1'] = l_l1.item()
+
+        # 2. Gradient Loss
+        w_grad = self.weights.get('grad', 0.0)
+        if w_grad > 0:
+            l_grad = self.grad(pred_prob, gt_f32)
+            total_loss += w_grad * l_grad
+            loss_dict['grad'] = l_grad.item()
+
+        # 3. SSIM Loss
+        w_ssim = self.weights.get('ssim', 0.0)
+        if w_ssim > 0:
+            l_ssim = self.ssim(pred_prob, gt_f32)
+            total_loss += w_ssim * l_ssim
+            loss_dict['ssim'] = l_ssim.item()
+
+        # --- C. Feature Alignment (Twin Strategy) ---
+        w_feat = self.weights.get('feat', 0.0)
+        if w_feat > 0 and stu_feats is not None and teacher_feats is not None:
+            l_feat = 0.0
+            # Align H/16 (Index 0 in list) and H/32 (Index 1 in list)
+            # Make sure lists are same length
+            min_len = min(len(stu_feats), len(teacher_feats))
+            for i in range(min_len):
+                l_feat += self.mse(stu_feats[i].float(), teacher_feats[i].float())
+            
+            total_loss += w_feat * l_feat
+            loss_dict['feat'] = l_feat.item()
+
+        return total_loss, loss_dict

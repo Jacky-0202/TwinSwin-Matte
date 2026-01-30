@@ -1,204 +1,227 @@
 # train.py
 
 import os
+import argparse
 import torch
-import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from torch.amp import autocast, GradScaler
 from tqdm import tqdm
-import numpy as np
 
-# Import Custom Modules
-import config
-from utils.dataset import DIS5KDataset
-from models.twin_swin_unet import TwinSwinUNet
-from models.mask_encoder import SwinMaskEncoder
-from utils.loss import MattingLoss
-from utils.logger import CSVLogger
+# --- Import Custom Modules ---
+from config import Config
+from models.twinswinunet import TwinSwinUNet
+from models.mask_encoder import MaskEncoder
+from utils.dataset import MattingDataset
+from utils.loss import TotalLoss
 from utils.metrics import calculate_matting_metrics
+from utils.logger import CSVLogger
 from utils.plot import plot_history
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="TwinSwin U-Net Training Script")
+    parser.add_argument('--resume', action='store_true', help='Resume training from last checkpoint')
+    return parser.parse_args()
+
 def train():
-    # --- 1. Setup ---
-    print(f"🚀 Starting training: {config.EXPERIMENT_NAME}")
-    print(f"   Device: {config.DEVICE}")
-    print(f"   Input Size: {config.IMG_SIZE}x{config.IMG_SIZE}")
-    print(f"   Dilation: {config.DILATE_MASK}")
-    print(f"   Twin Alignment: {config.USE_TWIN_ALIGNMENT}")
-
-    # Create directories
-    logger = CSVLogger(config.LOG_DIR)
+    args = parse_args()
     
-    # --- 2. Data Loading ---
-    print("📂 Loading Datasets...")
-    train_ds = DIS5KDataset(config.DATASET_ROOT, mode='train', 
-                            target_size=config.IMG_SIZE, dilate_mask=config.DILATE_MASK)
-    val_ds = DIS5KDataset(config.DATASET_ROOT, mode='val', 
-                          target_size=config.IMG_SIZE, dilate_mask=False) # Val uses raw GT
-
-    train_loader = DataLoader(train_ds, batch_size=config.BATCH_SIZE, 
-                              shuffle=True, num_workers=config.NUM_WORKERS, 
-                              pin_memory=config.PIN_MEMORY)
-    val_loader = DataLoader(val_ds, batch_size=1, # Val batch size 1 for accurate metrics
-                            shuffle=False, num_workers=config.NUM_WORKERS, 
-                            pin_memory=config.PIN_MEMORY)
-
-    print(f"   Train Images: {len(train_ds)}")
-    print(f"   Val Images: {len(val_ds)}")
-
-    # --- 3. Model Initialization ---
-    # A. Student Model (The Locator)
-    print(f"🔹 Initializing Student Model: {config.BACKBONE_NAME}")
-    model = TwinSwinUNet(n_classes=1, img_size=config.IMG_SIZE, 
-                         backbone_name=config.BACKBONE_NAME).to(config.DEVICE)
+    # =========================================================================
+    # 1. Setup Environment & Paths
+    # =========================================================================
+    save_dir = Config.CHECKPOINT_DIR
+    os.makedirs(save_dir, exist_ok=True)
     
-    # B. Teacher Model (Mask Encoder) - Only if alignment is enabled
-    teacher = None
-    if config.USE_TWIN_ALIGNMENT:
-        # [FIX] Get embed_dim dynamically from the Student model
-        # model.dims[0] corresponds to 'embed_dim' (e.g., 96 for Tiny, 128 for Base)
-        student_embed_dim = model.dims[0]
-        print(f"🎓 Initializing Teacher (Mask Encoder) with embed_dim={student_embed_dim}...")
-        
-        teacher = SwinMaskEncoder(embed_dim=student_embed_dim).to(config.DEVICE)
-        
-        teacher.eval() # Teacher is always in eval mode
-        for param in teacher.parameters():
-            param.requires_grad = False # Freeze Teacher
+    Config.print_info()
+    print(f"📂 Output Directory: {save_dir}")
 
-    # --- 4. Optimization ---
-    optimizer = optim.AdamW(model.parameters(), lr=config.LEARNING_RATE, weight_decay=config.WEIGHT_DECAY)
-    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2, eta_min=1e-6)
+    device = torch.device(Config.DEVICE)
+    torch.backends.cudnn.benchmark = True 
+
+    # =========================================================================
+    # 2. Data Loading
+    # =========================================================================
+    print("Dataset Loading...")
+    train_root = os.path.join(Config.DATA_ROOT, Config.TRAIN_SET)
+    val_root = os.path.join(Config.DATA_ROOT, Config.VAL_SET)
+
+    train_dataset = MattingDataset(
+        root_dir=train_root, mode='train', 
+        target_size=Config.IMG_SIZE, schema=Config.SCHEMA      
+    )
+    val_dataset = MattingDataset(
+        root_dir=val_root, mode='val', 
+        target_size=Config.IMG_SIZE, schema=Config.SCHEMA
+    )
+
+    train_loader = DataLoader(
+        train_dataset, batch_size=Config.BATCH_SIZE, shuffle=True,
+        num_workers=Config.NUM_WORKERS, pin_memory=Config.PIN_MEMORY, drop_last=True 
+    )
+    val_loader = DataLoader(
+        val_dataset, batch_size=1, shuffle=False,
+        num_workers=Config.NUM_WORKERS, pin_memory=Config.PIN_MEMORY
+    )
     
-    # Use mixed precision scaler
-    scaler = torch.amp.GradScaler('cuda') 
+    print(f"   - Train Images: {len(train_dataset)} | Val Images: {len(val_dataset)}")
 
-    loss_fn = MattingLoss(**config.LOSS_WEIGHTS).to(config.DEVICE)
+    # =========================================================================
+    # 3. Model Initialization
+    # =========================================================================
+    model = TwinSwinUNet().to(device)
+    
+    teacher_model = None
+    if Config.USE_TWIN_ALIGNMENT:
+        print("🎓 Initializing Teacher Network (MaskEncoder)...")
+        teacher_model = MaskEncoder(embed_dim=Config.EMBED_DIM).to(device)
+        teacher_model.eval() 
+        for p in teacher_model.parameters():
+            p.requires_grad = False
+    
+    # =========================================================================
+    # 4. Optimizer, Scheduler & Loss
+    # =========================================================================
+    optimizer = optim.AdamW(model.parameters(), lr=Config.LR, weight_decay=Config.WEIGHT_DECAY)
+    
+    # [Improvement] Added LR Scheduler for Swin Transformer stability
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=Config.NUM_EPOCHS)
+    
+    criterion = TotalLoss().to(device)
+    scaler = GradScaler() 
 
-    # --- 5. Training Loop ---
-    best_iou = 0.0
-    history = {'train_loss':[], 'val_loss':[], 'train_sad':[], 'val_sad':[], 
-               'train_grad':[], 'val_grad':[], 'train_mse':[], 'val_mse':[], 'train_acc':[], 'val_acc':[]}
+    # =========================================================================
+    # 5. History & Resume Logic
+    # =========================================================================
+    start_epoch = 0
+    best_val_sad = float('inf') 
+    history = {
+        'train_loss': [], 'val_loss': [], 'train_sad': [], 'val_sad': [],
+        'train_grad': [], 'val_grad': [], 'train_mse': [], 'val_mse': [],
+        'train_acc': [], 'val_acc': []
+    }
 
-    for epoch in range(1, config.NUM_EPOCHS + 1):
+    checkpoint_path = os.path.join(save_dir, 'last_model.pth')
+    if args.resume and os.path.exists(checkpoint_path):
+        print(f"🔄 Resuming from: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path)
+        model.load_state_dict(checkpoint['state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        scaler.load_state_dict(checkpoint['scaler'])
+        if 'scheduler' in checkpoint:
+            scheduler.load_state_dict(checkpoint['scheduler'])
+        start_epoch = checkpoint['epoch'] + 1
+        best_val_sad = checkpoint.get('best_sad', float('inf'))
+        history = checkpoint.get('history', history)
+    
+    logger = CSVLogger(save_dir=save_dir, filename='training_log.csv', resume=args.resume)
+
+    # =========================================================================
+    # 7. Training Loop
+    # =========================================================================
+    print(f"🚀 Starting Training (Epoch {start_epoch+1} -> {Config.NUM_EPOCHS})")
+    accum_steps = Config.GRAD_ACCUM_STEPS
+
+    for epoch in range(start_epoch, Config.NUM_EPOCHS):
+        # --- TRAIN PHASE ---
         model.train()
-        train_loss_epoch = 0
-        train_metrics = [0, 0, 0, 0] # mse, sad, grad, acc
+        train_metrics = {'loss': 0, 'mse': 0, 'sad': 0, 'grad': 0, 'acc': 0}
+        optimizer.zero_grad()
 
-        train_loop = tqdm(train_loader, desc=f"Epoch {epoch}/{config.NUM_EPOCHS} [Train]")
+        pbar = tqdm(train_loader, desc=f"Ep {epoch+1}/{Config.NUM_EPOCHS} [Train]")
         
-        for images, masks in train_loop:
-            images = images.to(config.DEVICE)
-            masks = masks.to(config.DEVICE)
+        for step, (images, masks) in enumerate(pbar):
+            # Dimension Safety Checks
+            if images.dim() == 3: images = images.unsqueeze(0)
+            if masks.dim() == 3: masks = masks.unsqueeze(0)   
+            if masks.dim() == 3: masks = masks.unsqueeze(1)
 
-            # --- Forward ---
-            with torch.amp.autocast('cuda'):
-                # 1. Teacher Forward (Get Target Features)
-                tea_feats = None
-                if teacher is not None:
-                    with torch.no_grad():
-                        tea_feats = teacher(masks)
+            images, masks = images.to(device, non_blocking=True), masks.to(device, non_blocking=True)
 
-                # 2. Student Forward
-                output = model(images)
+            with autocast(device_type='cuda', enabled=Config.USE_AMP):
+                outputs = model(images) 
                 
-                stu_feats = None
-                if isinstance(output, tuple):
-                    preds, stu_feats = output
-                else:
-                    preds = output
+                t_feats = None
+                if teacher_model is not None:
+                    with torch.no_grad():
+                        masks_teacher = F.interpolate(masks, size=(Config.SAFE_SIZE, Config.SAFE_SIZE), mode='nearest')
+                        t_feats = teacher_model(masks_teacher)
 
-                # 3. Calculate Loss
-                loss, _, _, _ = loss_fn(preds, masks, stu_feats, tea_feats)
+                loss, loss_dict = criterion(outputs, masks, teacher_feats=t_feats)
+                loss = loss / accum_steps 
 
-            # --- Backward ---
-            optimizer.zero_grad()
+                # [FIX] Calculate Metrics properly during Training
+                with torch.no_grad():
+                    pred_prob = torch.sigmoid(outputs['fine']).detach()
+                    mse, sad, grad, acc = calculate_matting_metrics(pred_prob, masks)
+                    train_metrics['mse'] += mse
+                    train_metrics['sad'] += sad
+                    train_metrics['grad'] += grad
+                    train_metrics['acc'] += acc
+
             scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
 
-            # --- Metrics ---
-            train_loss_epoch += loss.item()
-            with torch.no_grad():
-                # Sigmoid for metric calculation (preds are logits)
-                pred_final = torch.sigmoid(preds)
-                m_vals = calculate_matting_metrics(pred_final, masks)
-                for i in range(4): train_metrics[i] += m_vals[i]
+            # Optimizer Step with Gradient Accumulation
+            if (step + 1) % accum_steps == 0:
+                # [Improvement] Gradient Clipping for stability
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+            
+            curr_l = loss.item() * accum_steps
+            train_metrics['loss'] += curr_l
+            pbar.set_postfix({'L': f"{curr_l:.4f}", 'SAD': f"{sad:.1f}"})
 
-            train_loop.set_postfix(loss=loss.item())
+        # --- VALIDATION PHASE ---
+        model.eval()
+        val_metrics = {'loss': 0, 'mse': 0, 'sad': 0, 'grad': 0, 'acc': 0}
+        pbar_v = tqdm(val_loader, desc=f"Ep {epoch+1} [Val]")
+        
+        with torch.no_grad():
+            for imgs, msks in pbar_v:
+                if imgs.dim() == 3: imgs = imgs.unsqueeze(0)
+                if msks.dim() == 3: msks = msks.unsqueeze(0); msks = msks.unsqueeze(1)
 
-        # End of Epoch Scheduling
+                imgs, msks = imgs.to(device), msks.to(device)
+                pred = model(imgs) # Eval mode returns Sigmoid output directly
+                
+                mse, sad, grad, acc = calculate_matting_metrics(pred, msks)
+                val_metrics['loss'] += F.l1_loss(pred, msks).item()
+                val_metrics['mse'] += mse; val_metrics['sad'] += sad; val_metrics['grad'] += grad; val_metrics['acc'] += acc
+
+        # --- UPDATE STATISTICS ---
+        # Helper to average metrics
+        avg_t = {k: v / len(train_loader) for k, v in train_metrics.items()}
+        avg_v = {k: v / len(val_loader) for k, v in val_metrics.items()}
+
+        for k in history.keys():
+            history[k].append(avg_t[k.split('_')[1]] if 'train' in k else avg_v[k.split('_')[1]])
+
+        # Step the scheduler
         scheduler.step()
 
-        # Averages
-        train_loss_epoch /= len(train_loader)
-        train_metrics = [x / len(train_loader) for x in train_metrics]
-
-        # --- Validation ---
-        val_loss_epoch = 0
-        val_metrics = [0, 0, 0, 0]
-        model.eval()
-
-        val_loop = tqdm(val_loader, desc=f"Epoch {epoch}/{config.NUM_EPOCHS} [Val]")
-
-        with torch.no_grad():
-            for images, masks in val_loop:
-                images = images.to(config.DEVICE)
-                masks = masks.to(config.DEVICE)
-
-                # Validation Forward (No Teacher needed)
-                output = model(images)
-                if isinstance(output, tuple): preds, _ = output
-                else: preds = output
-                
-                # Validation Loss (Alignment skipped)
-                # Note: We need to use autocast here too if using AMP models
-                with torch.amp.autocast('cuda'):
-                    loss, _, _, _ = loss_fn(preds, masks) 
-                
-                val_loss_epoch += loss.item()
-                
-                pred_final = torch.sigmoid(preds)
-                m_vals = calculate_matting_metrics(pred_final, masks)
-                for i in range(4): val_metrics[i] += m_vals[i]
-
-                val_loop.set_postfix(loss=loss.item())
-
-        val_loss_epoch /= len(val_loader)
-        val_metrics = [x / len(val_loader) for x in val_metrics]
-
-        # --- Logging ---
-        log_data = [epoch, optimizer.param_groups[0]['lr'], 
-                    train_loss_epoch, *train_metrics, 
-                    val_loss_epoch, *val_metrics]
-        logger.log(log_data)
-
-        # Update History
-        history['train_loss'].append(train_loss_epoch); history['val_loss'].append(val_loss_epoch)
-        history['train_mse'].append(train_metrics[0]); history['val_mse'].append(val_metrics[0])
-        history['train_sad'].append(train_metrics[1]); history['val_sad'].append(val_metrics[1])
-        history['train_grad'].append(train_metrics[2]); history['val_grad'].append(val_metrics[2])
-        history['train_acc'].append(train_metrics[3]); history['val_acc'].append(val_metrics[3])
-
-        print(f"📉 Epoch {epoch} | Train Loss: {train_loss_epoch:.4f} | Val Loss: {val_loss_epoch:.4f} | Val IoU(Acc): {val_metrics[3]:.2f}%")
-
-        # --- Save Best Model ---
-        current_iou = val_metrics[3]
-        if current_iou > best_iou:
-            best_iou = current_iou
-            torch.save(model.state_dict(), config.BEST_MODEL_PATH)
-            print(f"💾 Best Model Saved! IoU: {best_iou:.2f}%")
+        # Log & Plot
+        cur_lr = optimizer.param_groups[0]['lr']
+        logger.log([epoch+1, cur_lr, avg_t['loss'], avg_t['mse'], avg_t['sad'], avg_t['grad'], avg_t['acc'],
+                    avg_v['loss'], avg_v['mse'], avg_v['sad'], avg_v['grad'], avg_v['acc']])
         
-        torch.save(model.state_dict(), config.LAST_MODEL_PATH)
+        print(f"📊 Ep {epoch+1} Summary: Train SAD: {avg_t['sad']:.1f} | Val SAD: {avg_v['sad']:.1f} | Acc: {avg_v['acc']:.2f}%")
+        plot_history(history['train_loss'], history['val_loss'], history['train_sad'], history['val_sad'], 
+                     history['train_grad'], history['val_grad'], history['train_mse'], history['val_mse'], 
+                     history['train_acc'], history['val_acc'], save_dir=save_dir)
 
-        # Plot every 5 epochs
-        if epoch % 5 == 0:
-            plot_history(history['train_loss'], history['val_loss'], 
-                         history['train_sad'], history['val_sad'],
-                         history['train_grad'], history['val_grad'],
-                         history['train_mse'], history['val_mse'],
-                         history['train_acc'], history['val_acc'],
-                         config.LOG_DIR)
+        # Save Checkpoints
+        state = {'epoch': epoch, 'state_dict': model.state_dict(), 'optimizer': optimizer.state_dict(), 
+                 'scheduler': scheduler.state_dict(), 'scaler': scaler.state_dict(), 'best_sad': best_val_sad, 'history': history}
+        torch.save(state, os.path.join(save_dir, 'last_model.pth'))
 
-if __name__ == "__main__":
+        if avg_v['sad'] < best_val_sad:
+            best_val_sad = avg_v['sad']
+            torch.save(state, os.path.join(save_dir, 'best_model.pth'))
+            print(f"🏆 Saved New Best Model (SAD: {best_val_sad:.4f})")
+
+if __name__ == '__main__':
     train()

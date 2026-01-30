@@ -13,11 +13,9 @@ env/
 
 # 訓練產出的檔案
 checkpoints/
-logs/
 
 # 測試結果 (讓使用者自己跑 predict.py 產生)
-test_data/
-test_results/
+results/
 
 # 系統檔案
 .DS_Store

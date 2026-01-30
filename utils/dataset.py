@@ -5,145 +5,137 @@ import cv2
 import torch
 import numpy as np
 from torch.utils.data import Dataset
-from torchvision import transforms
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
 
-class DIS5KDataset(Dataset):
-    def __init__(self, root_dir, mode='train', target_size=1024, dilate_mask=True):
+from config import Config
+
+class MattingDataset(Dataset):
+    def __init__(self, root_dir, mode='train', target_size=1024, schema='standard'):
         """
-        DIS5K Dataset with Letterbox Resize (Keep Aspect Ratio).
+        Universal Matting Dataset Loader.
+        Adapts to different folder structures (DIS5K, COD10K, etc.) based on 'schema'.
         
         Args:
-            root_dir (str): Path to 'Datasets/DIS5K_Flat/'
-            mode (str): 'train' or 'val'
-            target_size (int): The long-side resolution (e.g., 1024).
-            dilate_mask (bool): Whether to apply slight dilation to GT (crucial for thin structures).
+            root_dir (str): Full path to the specific dataset subset (e.g., .../DIS5K/DIS-TR).
+            mode (str): 'train' (enables augmentation) or 'val' (deterministic).
+            target_size (int): Resolution.
+            schema (str): 'standard' (im/gt) or 'cod10k' (Image/GT) or 'hrsod' (imgs/masks).
         """
         self.root_dir = root_dir
         self.mode = mode
         self.target_size = target_size
-        self.dilate_mask = dilate_mask
+        self.dilate_mask = Config.DILATE_MASK
         
-        # 1. Setup Paths
-        # Structure: root/train/im/*.jpg, root/train/gt/*.png
-        self.img_folder = os.path.join(root_dir, mode, 'im')
-        self.mask_folder = os.path.join(root_dir, mode, 'gt')
+        # =========================================================
+        # 1. Define Folder Names based on Schema
+        # =========================================================
+        if schema == 'standard':
+            # DIS5K, HRS10K, HRSOD (Standard)
+            img_dir_name, gt_dir_name = 'im', 'gt'
+        elif schema == 'cod10k':
+            # COD10K (Often uses Image/GT or Imgs/GT)
+            # We try to auto-detect common variations for COD10K
+            if os.path.exists(os.path.join(root_dir, 'Image')):
+                img_dir_name, gt_dir_name = 'Image', 'GT'
+            elif os.path.exists(os.path.join(root_dir, 'Imgs')):
+                img_dir_name, gt_dir_name = 'Imgs', 'GT'
+            else:
+                # Fallback to standard if capital folder not found
+                img_dir_name, gt_dir_name = 'im', 'gt'
+        elif schema == 'hrsod':
+            img_dir_name, gt_dir_name = 'imgs', 'masks'
+        else:
+            raise ValueError(f"Unknown schema: {schema}")
+
+        # =========================================================
+        # 2. Construct & Validate Paths
+        # =========================================================
+        self.img_folder = os.path.join(root_dir, img_dir_name)
+        self.mask_folder = os.path.join(root_dir, gt_dir_name)
         
-        # 2. Check Paths
         if not os.path.exists(self.img_folder) or not os.path.exists(self.mask_folder):
-            raise FileNotFoundError(f"Folder not found. Check: {self.img_folder}")
+            raise FileNotFoundError(
+                f"❌ Dataset structure error! \n"
+                f"   Schema: '{schema}' \n"
+                f"   Looking for folders inside: {root_dir}\n"
+                f"   - Images: {img_dir_name} (Found: {os.path.exists(self.img_folder)})\n"
+                f"   - Masks:  {gt_dir_name} (Found: {os.path.exists(self.mask_folder)})\n"
+                f"   Please check your config.py TRAIN_SET/VAL_SET paths."
+            )
             
         # 3. Load File List
-        valid_ext = ('.jpg', '.jpeg', '.png')
+        valid_ext = ('.jpg', '.jpeg', '.png', '.bmp', '.tif')
         self.image_files = sorted([f for f in os.listdir(self.img_folder) if f.lower().endswith(valid_ext)])
         
-        print(f"[{mode.upper()}] Found {len(self.image_files)} images in {self.img_folder}")
+        print(f"[{mode.upper()}] Loaded {len(self.image_files)} images from: {self.img_folder}")
 
-        # 4. Normalization (ImageNet stats)
-        # Using standard mean/std for pre-trained backbones
-        self.mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-        self.std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        # 4. Define Transformations (Albumentations)
+        if mode == 'train':
+            self.transform = A.Compose([
+                # Global Context & Geometry
+                A.ShiftScaleRotate(scale_limit=0.5, rotate_limit=0, shift_limit=0.1, p=0.5, border_mode=0),
+                A.HorizontalFlip(p=0.5),
+                # Color
+                A.RandomBrightnessContrast(p=0.2),
+                # Resize & Pad
+                A.LongestMaxSize(max_size=target_size),
+                A.PadIfNeeded(
+                    min_height=target_size, 
+                    min_width=target_size, 
+                    position='center',
+                    border_mode=0,
+                ),
+                # Normalize
+                A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+                ToTensorV2(),
+            ])
+        else:
+            # Val/Test
+            self.transform = A.Compose([
+                A.LongestMaxSize(max_size=target_size),
+                A.PadIfNeeded(
+                    min_height=target_size, 
+                    min_width=target_size, 
+                    position='center',
+                    border_mode=0,
+                ),
+                A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+                ToTensorV2(),
+            ])
 
     def __len__(self):
         return len(self.image_files)
 
-    def _letterbox(self, img, mask, target_size):
-        """
-        Resize image and mask while keeping aspect ratio. 
-        Pad the shorter side with zeros (black).
-        """
-        h, w = img.shape[:2]
-        scale = target_size / max(h, w)
-        
-        new_w = int(w * scale)
-        new_h = int(h * scale)
-        
-        # Resize
-        # Image: Cubic/Linear for better quality
-        # Mask: Linear/Area to preserve soft edges (if using soft labels) or Nearest
-        img_resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-        mask_resized = cv2.resize(mask, (new_w, new_h), interpolation=cv2.INTER_NEAREST) # Or LINEAR if you want soft edges
-        
-        # Create canvas
-        canvas_img = np.zeros((target_size, target_size, 3), dtype=np.uint8)
-        canvas_mask = np.zeros((target_size, target_size), dtype=np.uint8)
-        
-        # Paste in center
-        start_x = (target_size - new_w) // 2
-        start_y = (target_size - new_h) // 2
-        
-        canvas_img[start_y:start_y+new_h, start_x:start_x+new_w] = img_resized
-        canvas_mask[start_y:start_y+new_h, start_x:start_x+new_w] = mask_resized
-        
-        return canvas_img, canvas_mask
-
     def __getitem__(self, index):
-        # --- A. Load Data ---
+        # 1. Read Image
         img_name = self.image_files[index]
         img_path = os.path.join(self.img_folder, img_name)
         
-        # Find corresponding mask
-        file_stem = os.path.splitext(img_name)[0]
-        mask_name = file_stem + '.png' # Masks are usually png
-        mask_path = os.path.join(self.mask_folder, mask_name)
-        
-        # Fallback if mask has different extension
-        if not os.path.exists(mask_path):
-             mask_path = os.path.join(self.mask_folder, file_stem + '.jpg')
-
-        # Read Image (BGR -> RGB)
         image = cv2.imread(img_path)
         if image is None:
-            print(f"⚠️ Error reading image: {img_path}")
-            return self.__getitem__((index + 1) % len(self)) # Skip broken
+            return self.__getitem__((index + 1) % len(self)) 
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         
-        # Read Mask (Grayscale)
+        # 2. Read Mask (Smart Extension)
+        file_stem = os.path.splitext(img_name)[0]
+        mask_path = os.path.join(self.mask_folder, file_stem + '.png')
+        if not os.path.exists(mask_path):
+            mask_path = os.path.join(self.mask_folder, file_stem + '.jpg')
+            
         mask = cv2.imread(mask_path, 0)
         if mask is None:
-            print(f"⚠️ Error reading mask: {mask_path}")
             return self.__getitem__((index + 1) % len(self))
 
-        # --- B. Pre-processing (Dilation) ---
-        # Keep detail
+        # 3. Dynamic GT Dilation (Train Only)
         if self.dilate_mask and self.mode == 'train':
             kernel = np.ones((3, 3), np.uint8)
             mask = cv2.dilate(mask, kernel, iterations=1)
 
-        # --- C. Augmentation (Train Only) ---
-        if self.mode == 'train':
-            # 1. Random Horizontal Flip
-            if np.random.rand() > 0.5:
-                image = cv2.flip(image, 1)
-                mask = cv2.flip(mask, 1)
-            
-            # 2. Color Jitter (Simulated with simple numpy ops)
-            if np.random.rand() > 0.2:
-                # Brightness
-                value = np.random.uniform(0.8, 1.2)
-                image = np.clip(image * value, 0, 255).astype(np.uint8)
-
-        # --- D. Letterbox Resize (The Core Logic) ---
-        image, mask = self._letterbox(image, mask, self.target_size)
-
-        # --- E. To Tensor & Normalize ---
-        # Image: (H, W, 3) -> (3, H, W), Float32, 0-1, Normalize
-        image = image.astype(np.float32) / 255.0
-        image = (image - self.mean) / self.std
-        image = image.transpose(2, 0, 1) # HWC -> CHW
-        image = torch.from_numpy(image).float()
+        # 4. Augmentation
+        augmented = self.transform(image=image, mask=mask)
+        img_tensor = augmented['image']
+        mask_tensor = augmented['mask'].float() / 255.0
+        mask_tensor = mask_tensor.unsqueeze(0)
         
-        # Mask: (H, W) -> (1, H, W), Float32, 0-1
-        mask = mask.astype(np.float32) / 255.0
-        mask = np.expand_dims(mask, axis=0) # Add channel dim
-        mask = torch.from_numpy(mask).float()
-        
-        return image, mask
-
-# simple test
-# if __name__ == "__main__":
-#     root = "datasets_matte/DIS5K_Flat/"
-#     if os.path.exists(root):
-#         ds = DIS5KDataset(root, mode='train', target_size=1024)
-#         img, mask = ds[0]
-#         print(f"Image Shape: {img.shape}") # Should be (3, 1024, 1024)
-#         print(f"Mask Shape: {mask.shape}") # Should be (1, 1024, 1024)
+        return img_tensor, mask_tensor
