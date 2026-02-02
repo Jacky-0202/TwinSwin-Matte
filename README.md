@@ -3,23 +3,36 @@
 TwinSwin-Matte is a high-resolution image matting framework that synergizes the global modeling power of Swin Transformers with the local precision of CNNs. Designed for H200 GPU environments, it leverages a Teacher-Student distillation strategy and a Decoupled Resolution approach to achieve SOTA-level edge accuracy on the DIS5K dataset.
 
 ---
-### 🚀 Key Innovations
+## 🚀 Key Innovations
 
-- Decoupled Resolution Strategy: 
-Operates the Swin backbone at a mathematically "Safe Size" ($896\times896$) to maintain window-attention integrity while delivering final outputs at $1024\times1024$.
-- Twin Alignment (Distillation): 
-A CNN-based MaskEncoder (Teacher) guides the TwinSwin (Student) through feature-level alignment, infusing local inductive bias into the Transformer architecture.
-- Hybrid Architecture: 
-Combines a hierarchical Swin Transformer encoder with a multi-stage CNN decoder for superior semantic understanding and boundary refinement.
-- H200 Optimized: Fully integrated with AMP (Mixed Precision) and Gradient Accumulation to maximize throughput on NVIDIA H200 hardware.
+* **Twin Alignment (Distillation)**: A CNN-based **MaskEncoder (Teacher)** guides the **TwinSwin (Student)**. This structural guidance eliminates the "uncertainty fog" around object boundaries, sharpening predictions while preserving natural alpha transitions.
+* **Decoupled Resolution Strategy**: Operates the Swin backbone at a mathematically "Safe Size" ($896\times896$) to maintain window-attention integrity while delivering final outputs at $1024\times1024$.
+* **Hybrid Architecture**: Combines a hierarchical Swin Transformer encoder with a multi-stage CNN decoder for superior semantic understanding and boundary refinement.
+* **H200 Optimized**: Fully integrated with **AMP (Mixed Precision)** and Gradient Accumulation to maximize throughput on NVIDIA H200 hardware.
 
 ---
-### 🧠 Model Architecture
+
+## 🔬 Visual Analysis: The "Halo" Phenomenon
+
+We observed three distinct behaviors during the training process, highlighting the importance of our Twin Alignment strategy.
+
+| State | Config | Observation | Analysis |
+| :--- | :--- | :--- | :--- |
+| **1. Uncertainty Fog** | `No Teacher` <br> `No Dilation` | Correct shape, but surrounded by a large, gray semi-transparent halo (~128 value). | **Model Uncertainty**: Without structural guidance, the Swin Transformer hesitates at boundaries, outputting low-confidence predictions (0.3-0.6) spread across a wide area. |
+| **2. Brute Force** | `No Teacher` <br> `With Dilation` | No halo, but edges are jagged/rough. Background noise is often misclassified as foreground. | **Forced Overfitting**: Dilation forces the model to treat edges as solid binary masks. This destroys hair/fur details and causes the model to overfit to texture noise. |
+| **3. Twin Alignment** | `With Teacher` <br> `No Dilation` | **Optimal Result**. Minimal halo (anti-aliasing) with precise solid cores (255). | **Distillation Success**: The Teacher enforces structural priors, giving the Student confidence to sharpen boundaries. The remaining micro-halo represents correct natural matting (alpha blending). |
+
+> **Insight**: The "small halo" preserved in the Twin Alignment method is critical for **Alpha Blending**. Unlike the jagged edges produced by dilation, this natural transition allows the extracted subject to blend seamlessly into new backgrounds.
+
+![Model Compare](figures/twin_swin_matte_001.png)
+
+---
+
+## 🏗️ Architecture
 
 The framework consists of two primary components:
-
-Student (TwinSwinUNet): Swin-Base Encoder + Refined CNN Decoder.
-Teacher (MaskEncoder): A Pure FPN (Feature Pyramid Network) extracting structural priors from ground-truth masks.
+1.  **Student (TwinSwinUNet)**: Swin-Base Encoder + Refined CNN Decoder.
+2.  **Teacher (MaskEncoder)**: A Pure FPN (Feature Pyramid Network) extracting structural priors from ground-truth masks.
 
 ![Model Architecture](figures/twin_swin_matte_002.png)
 

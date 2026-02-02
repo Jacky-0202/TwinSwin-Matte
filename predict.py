@@ -13,7 +13,7 @@ from models.twinswinunet import TwinSwinUNet
 # ==========================================
 # 🔧 USER CONFIGURATION
 # ==========================================
-CHECKPOINT_PATH = "./checkpoints/TwinSwin_DIS5K_MATTING_1024/best_model.pth"
+CHECKPOINT_PATH = "./checkpoints/TwinSwin_DIS5K_LOCATOR_1024_202601301620/best_model.pth"
 INPUT_PATH = "/home/tec/Desktop/Project/Datasets/Matte/DIS5K/DIS-TE1/im" 
 OUTPUT_DIR = "./results"
 # ==========================================

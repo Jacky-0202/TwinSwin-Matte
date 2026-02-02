@@ -123,7 +123,7 @@ class Config:
     USE_TWIN_ALIGNMENT = False # Enable Teacher-Student Feature Alignment
     
     # [Data Augmentation]
-    DILATE_MASK = True        # Slightly dilate mask (Helps robustness)
+    DILATE_MASK = False        # Slightly dilate mask (Helps robustness)
 
     # [Memory & Speed]
     BATCH_SIZE = 16            # Recommended: 2 for Large Model
@@ -158,7 +158,7 @@ class Config:
             'l1': 0.0,
             'grad': 0.0,
             'ssim': 0.0,
-            'feat': 0.1
+            'feat': 0.0
         }
 
     # =========================================================================
