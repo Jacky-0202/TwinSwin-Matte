@@ -16,6 +16,9 @@ checkpoints/
 
 # 測試結果 (讓使用者自己跑 predict.py 產生)
 results/
+results_dilate/
+results_with_tescher/
+results_without_teacher/
 
 # 系統檔案
 .DS_Store
